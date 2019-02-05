@@ -14,20 +14,18 @@
 package com.seyren.mongo;
 
 import static com.seyren.mongo.NiceDBObject.*;
-
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Set;
-
+import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Named;
-
+import org.apache.commons.lang.Validate;
 import org.bson.types.ObjectId;
 import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import com.mongodb.BasicDBObject;
 import com.mongodb.Bytes;
 import com.mongodb.CommandFailureException;
@@ -52,12 +50,13 @@ import com.seyren.core.util.hashing.TargetHash;
 
 @Named
 public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore {
-    
+
     private static final Logger LOGGER = LoggerFactory.getLogger(MongoStore.class);
-    
+
     private MongoMapper mapper = new MongoMapper();
+
     private DB mongo;
-    
+
     @Inject
     public MongoStore(SeyrenConfig seyrenConfig) {
         try {
@@ -72,7 +71,7 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
             throw new RuntimeException(e);
         }
     }
-    
+
     private void bootstrapMongo() {
         LOGGER.info("Bootstrapping Mongo indexes. Depending on the number of checks and alerts you've got it may take a little while.");
         try {
@@ -80,9 +79,7 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
             removeOldIndices();
             addTargetHashToAlerts();
         } catch (MongoException e) {
-            LOGGER.error("Failure while bootstrapping Mongo indexes.\n"
-                    + "If you've hit this problem it's possible that you have two checks which are named the same and violate an index which we've tried to add.\n"
-                    + "Please correct the problem by removing the clash. If it's something else, please let us know on Github!", e);
+            LOGGER.error("Failure while bootstrapping Mongo indexes.\n" + "If you've hit this problem it's possible that you have two checks which are named the same and violate an index which we've tried to add.\n" + "Please correct the problem by removing the clash. If it's something else, please let us know on Github!", e);
             throw new RuntimeException("Failed to bootstrap Mongo indexes. Please refer to the logs for more information.", e);
         }
         LOGGER.info("Done bootstrapping Mongo indexes.");
@@ -102,7 +99,6 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
             getAlertsCollection().dropIndex(new BasicDBObject("checkId", 1).append("target", 1));
         } catch (CommandFailureException e) {
             if (e.getCode() != -5) {
-                // -5 is the code which appears when the index doesn't exist (which we're happy with, anything else is bad news) 
                 throw e;
             }
         }
@@ -122,15 +118,25 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
             getAlertsCollection().save(mapper.alertToDBObject(alert));
         }
     }
-    
+
     private DBCollection getChecksCollection() {
         return mongo.getCollection("checks");
     }
-    
+
     private DBCollection getAlertsCollection() {
         return mongo.getCollection("alerts");
     }
-    
+
+    protected SeyrenResponse executeQueryAndCollectResponse(DBObject query) {
+        List<Check> checks = new ArrayList<Check>();
+        DBCursor dbc = getChecksCollection().find(query);
+        while (dbc.hasNext()) {
+            checks.add(mapper.checkFrom(dbc.next()));
+        }
+        dbc.close();
+        return new SeyrenResponse<Check>().withValues(checks).withTotal(dbc.count());
+    }
+
     @Override
     public SeyrenResponse<Check> getChecks(Boolean enabled, Boolean live) {
         List<Check> checks = new ArrayList<Check>();
@@ -145,32 +151,42 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
         while (dbc.hasNext()) {
             checks.add(mapper.checkFrom(dbc.next()));
         }
-        return new SeyrenResponse<Check>()
-                .withValues(checks)
-                .withTotal(dbc.count());
+        return new SeyrenResponse<Check>().withValues(checks).withTotal(dbc.count());
     }
-    
+
     @Override
     public SeyrenResponse<Check> getChecksByState(Set<String> states, Boolean enabled) {
         List<Check> checks = new ArrayList<Check>();
-        
         DBObject query = new BasicDBObject();
         query.put("state", object("$in", states.toArray()));
         if (enabled != null) {
             query.put("enabled", enabled);
         }
         DBCursor dbc = getChecksCollection().find(query);
-        
         while (dbc.hasNext()) {
             checks.add(mapper.checkFrom(dbc.next()));
         }
         dbc.close();
-        
-        return new SeyrenResponse<Check>()
-                .withValues(checks)
-                .withTotal(dbc.count());
+        return new SeyrenResponse<Check>().withValues(checks).withTotal(dbc.count());
     }
-    
+
+    @Override
+    public SeyrenResponse getChecksByPattern(List<String> checkFields, List<Pattern> patterns, Boolean enabled) {
+        Validate.notNull(checkFields, "Fields may not be null.");
+        Validate.notNull(patterns, "Patterns may not be null.");
+        Validate.notEmpty(checkFields, "Fields may not be empty");
+        Validate.notEmpty(patterns, "Patterns may not be empty");
+        Validate.isTrue(checkFields.size() == patterns.size(), String.format("Fields[%s] have same number of elements as patterns[%s].  " + "fieldsSize[%d] != fieldsSize[%d]", checkFields, patterns, checkFields.size(), patterns.size()));
+        DBObject query = new BasicDBObject();
+        for (int i = 0; i < checkFields.size(); i++) {
+            query.put(checkFields.get(i), patterns.get(i));
+        }
+        if (enabled != null) {
+            query.put("enabled", enabled);
+        }
+        return executeQueryAndCollectResponse(query);
+    }
+
     @Override
     public Check getCheck(String checkId) {
         DBObject dbo = getChecksCollection().findOne(object("_id", checkId));
@@ -179,54 +195,38 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
         }
         return mapper.checkFrom(dbo);
     }
-    
+
     @Override
     public void deleteCheck(String checkId) {
         getChecksCollection().remove(forId(checkId));
         deleteAlerts(checkId, null);
     }
-    
+
     @Override
     public Check createCheck(Check check) {
         check.setId(ObjectId.get().toString());
         getChecksCollection().insert(mapper.checkToDBObject(check));
         return check;
     }
-    
+
     @Override
     public Check saveCheck(Check check) {
+        DBObject findObject = forId(check.getId());
         DateTime lastCheck = check.getLastCheck();
-        
-        DBObject saveObject = forId(check.getId())
-                .with("name", check.getName())
-                .with("description", check.getDescription())
-                .with("target", check.getTarget())
-                .with("from", check.getFrom())
-                .with("until", check.getUntil())
-                .with("warn", check.getWarn().toPlainString())
-                .with("error", check.getError().toPlainString())
-                .with("enabled", check.isEnabled())
-                .with("live", check.isLive())
-                .with("lastCheck", lastCheck == null ? null : new Date(lastCheck.getMillis()))
-                .with("state", check.getState().toString());
-        
-        getChecksCollection().save(saveObject);
-        
+        DBObject partialObject = object("name", check.getName()).with("description", check.getDescription()).with("target", check.getTarget()).with("from", check.getFrom()).with("until", check.getUntil()).with("warn", check.getWarn().toPlainString()).with("error", check.getError().toPlainString()).with("enabled", check.isEnabled()).with("live", check.isLive()).with("lastCheck", lastCheck == null ? null : new Date(lastCheck.getMillis())).with("state", check.getState().toString());
+        DBObject setObject = object("$set", partialObject);
+        getChecksCollection().update(findObject, setObject);
         return check;
     }
-    
+
     @Override
     public void updateStateAndLastCheck(String checkId, AlertType state, DateTime lastCheck) {
         DBObject findObject = forId(checkId);
-        
-        DBObject partialObject = object("lastCheck", new Date(lastCheck.getMillis()))
-                .with("state", state.toString());
-        
+        DBObject partialObject = object("lastCheck", new Date(lastCheck.getMillis())).with("state", state.toString());
         DBObject setObject = object("$set", partialObject);
-        
         getChecksCollection().update(findObject, setObject);
     }
-    
+
     @Override
     public Alert createAlert(String checkId, Alert alert) {
         alert.setId(ObjectId.get().toString());
@@ -234,7 +234,7 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
         getAlertsCollection().insert(mapper.alertToDBObject(alert));
         return alert;
     }
-    
+
     @Override
     public SeyrenResponse<Alert> getAlerts(String checkId, int start, int items) {
         DBCursor dbc = getAlertsCollection().find(object("checkId", checkId)).sort(object("timestamp", -1)).skip(start).limit(items);
@@ -243,13 +243,9 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
             alerts.add(mapper.alertFrom(dbc.next()));
         }
         dbc.close();
-        return new SeyrenResponse<Alert>()
-                .withValues(alerts)
-                .withItems(items)
-                .withStart(start)
-                .withTotal(dbc.count());
+        return new SeyrenResponse<Alert>().withValues(alerts).withItems(items).withStart(start).withTotal(dbc.count());
     }
-    
+
     @Override
     public SeyrenResponse<Alert> getAlerts(int start, int items) {
         DBCursor dbc = getAlertsCollection().find().sort(object("timestamp", -1)).skip(start).limit(items);
@@ -258,24 +254,18 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
             alerts.add(mapper.alertFrom(dbc.next()));
         }
         dbc.close();
-        return new SeyrenResponse<Alert>()
-                .withValues(alerts)
-                .withItems(items)
-                .withStart(start)
-                .withTotal(dbc.count());
+        return new SeyrenResponse<Alert>().withValues(alerts).withItems(items).withStart(start).withTotal(dbc.count());
     }
-    
+
     @Override
     public void deleteAlerts(String checkId, DateTime before) {
         DBObject query = object("checkId", checkId);
-        
         if (before != null) {
             query.put("timestamp", object("$lt", new Date(before.getMillis())));
         }
-        
         getAlertsCollection().remove(query);
     }
-    
+
     @Override
     public Alert getLastAlertForTargetOfCheck(String target, String checkId) {
         DBObject query = object("checkId", checkId).with("targetHash", TargetHash.create(target));
@@ -289,7 +279,7 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
         }
         return null;
     }
-    
+
     @Override
     public Subscription createSubscription(String checkId, Subscription subscription) {
         subscription.setId(ObjectId.get().toString());
@@ -298,14 +288,14 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
         getChecksCollection().update(check, query);
         return subscription;
     }
-    
+
     @Override
     public void deleteSubscription(String checkId, String subscriptionId) {
         DBObject check = forId(checkId);
         BasicDBObject subscription = object("$pull", object("subscriptions", forId(subscriptionId)));
         getChecksCollection().update(check, subscription);
     }
-    
+
     @Override
     public void updateSubscription(String checkId, Subscription subscription) {
         DBObject subscriptionObject = mapper.subscriptionToDBObject(subscription);
@@ -314,5 +304,4 @@ public class MongoStore implements ChecksStore, AlertsStore, SubscriptionsStore 
         DBObject updateObject = object("$set", object("subscriptions.$", subscriptionObject));
         getChecksCollection().update(checkFindObject, updateObject);
     }
-    
 }
